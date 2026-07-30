@@ -6,6 +6,7 @@
 import { disposableTimeout } from '../../../base/common/async.js';
 import { Disposable, DisposableMap } from '../../../base/common/lifecycle.js';
 import { StopWatch } from '../../../base/common/stopwatch.js';
+import type { TodoStoreOperation, TodoStoreTarget } from '../../telemetry/common/todoStoreTelemetry.js';
 import type { SessionToolAuthenticationRequest, SessionToolClientExecutionRequest, SessionToolConfirmationRequest } from '../common/state/protocol/state.js';
 import { ToolCallContributorKind, type ToolCallContributor, type ToolCallResult } from '../common/state/sessionState.js';
 import type { AgentHostTelemetryReporter } from './agentHostTelemetryReporter.js';
@@ -62,6 +63,7 @@ interface IToolCallTiming {
 	readonly session: string;
 	readonly toolId: string;
 	readonly toolSourceKind: string;
+	todoStoreOperation: ITodoStoreOperationData | undefined;
 }
 
 interface IStalledToolCall {
@@ -100,7 +102,18 @@ export class AgentHostToolCallTracker extends Disposable {
 			session,
 			toolId: toolName,
 			toolSourceKind: toolSourceKindFromContributor(contributor),
+			todoStoreOperation: undefined,
 		});
+	}
+
+	toolCallReady(session: string, toolCallId: string, toolInput: string | undefined): void {
+		if (toolInput === undefined) {
+			return;
+		}
+		const timing = this._toolCalls.get(this._key(session, toolCallId));
+		if (timing?.toolSourceKind === 'agentHost') {
+			timing.todoStoreOperation = getTodoStoreOperationData(timing.toolId, toolInput);
+		}
 	}
 
 	toolCallCompleted(session: string, toolCallId: string, result: ToolCallResult): void {
@@ -121,9 +134,19 @@ export class AgentHostToolCallTracker extends Disposable {
 			session: timing.session,
 			toolId: timing.toolId,
 			toolSourceKind: timing.toolSourceKind,
+			toolCallId,
 			result: resultBucket,
 			invocationTimeMs: totalTimeMs,
 		});
+		const todoStoreOperation = result.success ? timing.todoStoreOperation : undefined;
+		if (todoStoreOperation) {
+			this._reporter.todoStoreOperation({
+				provider: timing.provider,
+				session: timing.session,
+				toolCallId,
+				...todoStoreOperation,
+			});
+		}
 
 		const stalled = this._stalledToolCalls.get(key);
 		if (stalled) {
@@ -200,4 +223,50 @@ export class AgentHostToolCallTracker extends Disposable {
 	private _key(session: string, toolCallId: string): string {
 		return `${session}\0${toolCallId}`;
 	}
+}
+
+interface ITodoStoreOperationData {
+	readonly operation: TodoStoreOperation;
+	readonly target: TodoStoreTarget;
+}
+
+export function getTodoStoreOperationData(toolId: string, toolInput: string | undefined): ITodoStoreOperationData | undefined {
+	if (toolId !== 'sql') {
+		return undefined;
+	}
+
+	const query = parseToolInput(toolInput)?.query;
+	if (typeof query !== 'string') {
+		return undefined;
+	}
+	const referencesTodos = /\btodos\b/i.test(query);
+	const referencesTodoDeps = /\btodo_deps\b/i.test(query);
+	if (!referencesTodos && !referencesTodoDeps) {
+		return undefined;
+	}
+	const reads = /\bselect\b/i.test(query);
+	const writes = /\b(?:insert|update|delete|replace|create|drop|alter)\b/i.test(query);
+	if (!reads && !writes) {
+		return undefined;
+	}
+	return {
+		operation: reads && writes ? 'mixed' : writes ? 'write' : 'read',
+		target: referencesTodos && referencesTodoDeps ? 'both' : referencesTodoDeps ? 'todo_deps' : 'todos',
+	};
+}
+
+function parseToolInput(toolInput: string | undefined): Record<string, unknown> | undefined {
+	if (toolInput === undefined) {
+		return undefined;
+	}
+	try {
+		const parsed: unknown = JSON.parse(toolInput);
+		return isRecord(parsed) ? parsed : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
